@@ -93,6 +93,11 @@ The CA is saved at `./ca/ca.crt` — only you have the private key.
 mhrv-rs.exe --config config.json    # Windows
 ```
 
+### Diagnostic subcommands
+
+- **`mhrv-rs test`** — send one request through the relay and report success/timing. Useful when setting up or debugging. Does not need the proxy to be running.
+- **`mhrv-rs scan-ips`** — parallel TLS probe of known Google frontend IPs, sorted by latency. Swap the winning IP into your `google_ip` config field for best performance.
+
 ### Step 6: Point your browser at the proxy
 
 Configure your browser to use HTTP proxy `127.0.0.1:8085`.
@@ -103,27 +108,33 @@ Configure your browser to use HTTP proxy `127.0.0.1:8085`.
 
 ## What's implemented vs not
 
-This port focuses on the **`apps_script` mode** which is the only one that reliably works in 2025. Implemented:
+This port focuses on the **`apps_script` mode** which is the only one that reliably works in 2026. Implemented:
 
 - [x] Local HTTP proxy (CONNECT for HTTPS, plain forwarding for HTTP)
-- [x] MITM with on-the-fly per-domain cert generation
-- [x] CA generation + auto-install on macOS/Linux/Windows
-- [x] Apps Script JSON relay (single-request mode), protocol-compatible with `Code.gs`
+- [x] MITM with on-the-fly per-domain cert generation via `rcgen`
+- [x] CA generation + auto-install on macOS / Linux / Windows
+- [x] Firefox NSS cert install (best effort via `certutil`)
+- [x] Apps Script JSON relay, protocol-compatible with `Code.gs`
 - [x] Connection pooling (45s TTL, max 20 idle)
+- [x] Gzip response decoding
 - [x] Multi-script round-robin
-- [x] Automatic redirect handling on the relay
+- [x] Auto-blacklist failing scripts on 429 / quota errors (10-minute cooldown)
+- [x] Response cache (50 MB, FIFO + TTL, parses `Cache-Control: max-age`, heuristics for static assets)
+- [x] Request coalescing: concurrent identical GETs share one upstream fetch
+- [x] SNI-rewrite tunnels for YouTube / googlevideo / doubleclick / etc. — bypass the relay entirely and go direct to Google's edge with SNI=`front_domain`
+- [x] Automatic redirect handling on the relay (`/exec` → `googleusercontent.com`)
 - [x] Header filtering (strip connection-specific + brotli)
+- [x] `mhrv-rs test` subcommand — one-shot end-to-end relay probe
+- [x] `mhrv-rs scan-ips` subcommand — parallel probe 28 Google frontend IPs, sorted by latency
+- [x] Periodic stats log every 60 s (relay calls, cache hit rate, bytes, active scripts)
+- [x] Script IDs masked in logs (prefix...suffix) so `info` logs don't leak deployment IDs
 
-Deferred (PRs welcome):
+Intentionally NOT implemented (rationale included so future contributors don't spend cycles on them):
 
-- [ ] HTTP/2 multiplexing
-- [ ] Request batching (`q: [...]` mode in `Code.gs`)
-- [ ] Request coalescing for concurrent identical GETs
-- [ ] Response cache
-- [ ] Range-based parallel download for large files
-- [ ] SNI-rewrite tunnels for YouTube/googlevideo (currently routes through full MITM+relay)
-- [ ] Firefox NSS cert install (manual: import `ca/ca.crt` in Firefox preferences)
-- [ ] Other modes (`domain_fronting`, `google_fronting`, `custom_domain`) — mostly broken post-Cloudflare 2024 crackdown, not a priority
+- [ ] **HTTP/2 multiplexing** — `h2` crate state machine (stream IDs, flow control, GOAWAY) has too many subtle hang cases; coalescing + 20-connection pool already gets most of the benefit for this workload
+- [ ] **Request batching (`q:[...]` mode)** — our connection pool + tokio async already parallelizes well; batching adds ~200 lines of state management with unclear incremental gain over the current flow
+- [ ] **Range-based parallel download** — edge cases (non-Range servers, chunked mid-stream, content-encoding) are real; YouTube-style video already bypasses Apps Script via SNI-rewrite tunnel
+- [ ] **Other modes** (`domain_fronting`, `google_fronting`, `custom_domain`) — Cloudflare killed generic domain fronting in 2024; Cloud Run needs paid plan; skip unless specifically requested
 
 ## License
 

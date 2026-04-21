@@ -50,6 +50,8 @@ pub struct Config {
     pub verify_ssl: bool,
     #[serde(default)]
     pub hosts: HashMap<String, String>,
+    #[serde(default)]
+    pub enable_batching: bool,
 }
 
 fn default_google_ip() -> String {
