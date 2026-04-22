@@ -32,9 +32,12 @@ pub fn install_ca(path: &Path) -> Result<(), InstallError> {
         other => return Err(InstallError::Unsupported(other.to_string())),
     };
 
-    // Best-effort: also try to install into Firefox NSS stores if certutil
-    // is available. Firefox maintains its own trust store separate from the OS.
-    install_firefox_nss(&path_s);
+    // Best-effort: also install into NSS stores if `certutil` is available.
+    // Both Firefox AND Chrome/Chromium on Linux maintain NSS databases that
+    // are independent of the OS trust store — which is why running
+    // update-ca-certificates alone wasn't enough for a lot of users
+    // (issue #11 on Linux was this).
+    install_nss_stores(&path_s);
 
     if ok {
         Ok(())
@@ -325,51 +328,195 @@ fn install_windows(cert_path: &str) -> bool {
     false
 }
 
-// ---------- Firefox (NSS) ----------
+// ---------- NSS (Firefox + Chrome/Chromium on Linux) ----------
 
-/// Best-effort install of the CA into all discovered Firefox profiles.
-/// Silently no-ops if `certutil` (from libnss3-tools) is not available.
-/// Firefox must be closed during install for changes to take effect.
-fn install_firefox_nss(cert_path: &str) {
-    // Check if certutil exists at all.
-    if Command::new("certutil")
-        .arg("--help")
-        .output()
-        .ok()
-        .map(|o| {
-            // macOS has a different certutil (built-in) that doesn't support -d.
-            // Look for NSS-specific flags in the help output.
-            String::from_utf8_lossy(&o.stderr).contains("-d")
-                || String::from_utf8_lossy(&o.stdout).contains("-d")
-        })
-        .unwrap_or(false)
-        == false
-    {
+/// Best-effort install of the CA into all discovered NSS stores:
+///   1. Every Firefox profile (each has its own cert9.db).
+///   2. On Linux, the shared Chrome/Chromium NSS DB at ~/.pki/nssdb —
+///      this is the one update-ca-certificates does NOT populate, and
+///      missing it was the real blocker for Chrome users who'd installed
+///      the OS-level CA and still got cert errors (part of issue #11).
+/// Silently no-ops if `certutil` (from libnss3-tools) isn't on PATH.
+/// Browsers must be closed during install for changes to take effect.
+fn install_nss_stores(cert_path: &str) {
+    // First, try to make Firefox pick up the OS-level CA automatically by
+    // flipping the `security.enterprise_roots.enabled` pref in user.js of
+    // every Firefox profile we find. This is the cleanest cross-platform
+    // fix because it doesn't depend on whether NSS certutil is installed
+    // — Firefox just starts trusting whatever the OS trusts. Especially
+    // important on Windows where NSS certutil isn't on PATH.
+    enable_firefox_enterprise_roots();
+
+    if !has_nss_certutil() {
         tracing::debug!(
-            "NSS certutil not found — Firefox users must import ca.crt manually \
-             via Settings -> Privacy & Security -> Certificates."
+            "NSS certutil not found — Firefox will still trust the CA via the \
+             `security.enterprise_roots.enabled` user.js pref (flipped above). \
+             For Chrome/Chromium on Linux, install `libnss3-tools` (Debian/Ubuntu) \
+             or `nss-tools` (Fedora/RHEL), or import ca.crt manually via \
+             chrome://settings/certificates → Authorities."
         );
-        return;
-    }
-
-    let profiles = firefox_profile_dirs();
-    if profiles.is_empty() {
-        tracing::debug!("no Firefox profiles found");
         return;
     }
 
     let mut ok = 0;
-    for p in &profiles {
-        if install_nss_in_profile(p, cert_path) {
+    let mut tried = 0;
+
+    // 1. Firefox profiles.
+    for p in firefox_profile_dirs() {
+        tried += 1;
+        if install_nss_in_profile(&p, cert_path) {
             ok += 1;
         }
     }
+
+    // 2. Chrome/Chromium shared NSS DB (Linux only).
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(nssdb) = chrome_nssdb_path() {
+            // Ensure the DB exists. certutil -N creates an empty cert9.db in
+            // the directory if none is there. An empty passphrase is fine
+            // for a user-local DB.
+            let dir_arg = format!("sql:{}", nssdb.display());
+            if !nssdb.join("cert9.db").exists() && !nssdb.join("cert8.db").exists() {
+                let _ = std::fs::create_dir_all(&nssdb);
+                let _ = Command::new("certutil")
+                    .args(["-N", "-d", &dir_arg, "--empty-password"])
+                    .output();
+            }
+            tried += 1;
+            if install_nss_in_dir(&dir_arg, cert_path) {
+                ok += 1;
+                tracing::info!(
+                    "CA installed in Chrome/Chromium NSS DB: {}",
+                    nssdb.display()
+                );
+            }
+        }
+    }
+
     if ok > 0 {
-        tracing::info!("CA installed in {} Firefox profile(s).", ok);
-    } else {
-        tracing::debug!(
-            "No Firefox profiles updated. If Firefox wasn't running, try installing manually."
+        tracing::info!("CA installed in {}/{} NSS store(s).", ok, tried);
+    } else if tried > 0 {
+        tracing::warn!(
+            "NSS install: 0/{} stores updated. If Firefox/Chrome was running, close \
+             them and retry. Otherwise, import ca.crt manually via browser settings.",
+            tried
         );
+    }
+}
+
+/// Write `user_pref("security.enterprise_roots.enabled", true);` to every
+/// discovered Firefox profile's user.js. This makes Firefox trust the OS
+/// trust store on next startup — so our already-successful system-level
+/// CA install automatically propagates. Critical on Windows where Firefox
+/// keeps its own NSS DB independent of Windows cert store, and NSS
+/// certutil isn't typically installed so the certutil-based path doesn't
+/// fire there.
+///
+/// Existing user.js entries for other prefs are preserved by appending
+/// rather than truncating. Idempotent.
+fn enable_firefox_enterprise_roots() {
+    const PREF: &str = r#"user_pref("security.enterprise_roots.enabled", true);"#;
+    let mut touched = 0;
+    for profile in firefox_profile_dirs() {
+        let user_js = profile.join("user.js");
+        let existing = std::fs::read_to_string(&user_js).unwrap_or_default();
+        if existing.contains("security.enterprise_roots.enabled") {
+            // Already set by us or the user. Replace-or-keep: if they set it
+            // to false we leave their choice alone. If it's already our line
+            // verbatim, nothing to do.
+            if existing.contains(PREF) {
+                continue;
+            }
+            // Different value present — don't overwrite.
+            tracing::debug!(
+                "firefox profile {} already has a different enterprise_roots pref; leaving alone",
+                profile.display()
+            );
+            continue;
+        }
+        let mut out = existing;
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(PREF);
+        out.push('\n');
+        if let Err(e) = std::fs::write(&user_js, out) {
+            tracing::debug!(
+                "firefox profile {}: user.js write failed: {}",
+                profile.display(),
+                e
+            );
+            continue;
+        }
+        touched += 1;
+    }
+    if touched > 0 {
+        tracing::info!(
+            "enabled Firefox enterprise_roots in {} profile(s) — restart Firefox for it to take effect",
+            touched
+        );
+    }
+}
+
+fn has_nss_certutil() -> bool {
+    Command::new("certutil")
+        .arg("--help")
+        .output()
+        .ok()
+        .map(|o| {
+            // macOS has a different certutil built-in that doesn't support -d.
+            // NSS-specific help output mentions the -d / -n flags.
+            String::from_utf8_lossy(&o.stderr).contains("-d")
+                || String::from_utf8_lossy(&o.stdout).contains("-d")
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn chrome_nssdb_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(std::path::PathBuf::from(format!("{}/.pki/nssdb", home)))
+}
+
+/// Install into a given sql: or legacy NSS DB path. Factored out so both
+/// Firefox-per-profile and Chrome-shared paths share one code path.
+fn install_nss_in_dir(dir_arg: &str, cert_path: &str) -> bool {
+    // Delete any stale entry first (ignore errors).
+    let _ = Command::new("certutil")
+        .args(["-D", "-n", CERT_NAME, "-d", dir_arg])
+        .output();
+
+    let res = Command::new("certutil")
+        .args([
+            "-A",
+            "-n",
+            CERT_NAME,
+            "-t",
+            "C,,",
+            "-d",
+            dir_arg,
+            "-i",
+            cert_path,
+        ])
+        .output();
+    match res {
+        Ok(o) if o.status.success() => {
+            tracing::debug!("NSS install ok: {}", dir_arg);
+            true
+        }
+        Ok(o) => {
+            tracing::debug!(
+                "NSS install failed for {}: {}",
+                dir_arg,
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            false
+        }
+        Err(e) => {
+            tracing::debug!("NSS certutil exec failed for {}: {}", dir_arg, e);
+            false
+        }
     }
 }
 
@@ -382,43 +529,7 @@ fn install_nss_in_profile(profile: &Path, cert_path: &str) -> bool {
         return false;
     };
     let dir_arg = format!("{}{}", prefix, profile.display());
-
-    // Delete any stale entry first (ignore errors).
-    let _ = Command::new("certutil")
-        .args(["-D", "-n", CERT_NAME, "-d", &dir_arg])
-        .output();
-
-    let res = Command::new("certutil")
-        .args([
-            "-A",
-            "-n",
-            CERT_NAME,
-            "-t",
-            "C,,",
-            "-d",
-            &dir_arg,
-            "-i",
-            cert_path,
-        ])
-        .output();
-    match res {
-        Ok(o) if o.status.success() => {
-            tracing::debug!("NSS install ok: {}", profile.display());
-            true
-        }
-        Ok(o) => {
-            tracing::debug!(
-                "NSS install failed for {}: {}",
-                profile.display(),
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-            false
-        }
-        Err(e) => {
-            tracing::debug!("NSS certutil exec failed for {}: {}", profile.display(), e);
-            false
-        }
-    }
+    install_nss_in_dir(&dir_arg, cert_path)
 }
 
 fn firefox_profile_dirs() -> Vec<std::path::PathBuf> {
